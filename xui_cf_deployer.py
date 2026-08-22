@@ -2803,19 +2803,27 @@ def get_public_ipv4_safe() -> str:
 
 
 def _cf_post_json(url: str, headers: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]:
-    """使用 urllib 直接 POST JSON 到 Cloudflare API（绕过 call_json_api 的空 body 404 问题）。"""
-    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    req = request.Request(url, data=body, method="POST", headers=headers)
+    """使用 curl POST JSON 到 Cloudflare API（urllib 在某些端点返回空 body 404）。"""
+    email = headers.get("X-Auth-Email", "")
+    key = headers.get("X-Auth-Key", "")
+    body = json.dumps(data, ensure_ascii=False)
+    cmd = [
+        "curl", "-s", "-X", "POST", url,
+        "-H", f"X-Auth-Email: {email}",
+        "-H", f"X-Auth-Key: {key}",
+        "-H", "Content-Type: application/json",
+        "-d", body,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if not stdout and stderr:
+        print(f"  [API ERROR] curl stderr: {stderr[:300]}")
     try:
-        with request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        print(f"  [API ERROR] HTTP {e.code} {err_body[:500]}")
-        try:
-            return json.loads(err_body)
-        except json.JSONDecodeError:
-            return {"success": False, "errors": [{"message": f"HTTP {e.code}: {err_body}"}]}
+        return json.loads(stdout) if stdout else {"success": False, "errors": [{"message": "empty response"}]}
+    except json.JSONDecodeError:
+        print(f"  [API ERROR] raw: {stdout[:200] or stderr[:200]}")
+        return {"success": False, "errors": [{"message": stdout or stderr or "curl failed"}]}
 
 
 def create_fixed_argo_tunnel(
