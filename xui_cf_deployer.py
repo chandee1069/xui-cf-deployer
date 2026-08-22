@@ -2114,12 +2114,12 @@ def allocate_settings() -> Dict[str, Any]:
     return {"strategy": "always", "refresh": 5, "concurrency": 3}
 
 
-def build_inbound_payload(protocol: str, user_uuid: str, short_id: str, route: Dict[str, Any]) -> Dict[str, Any]:
+def build_inbound_payload(protocol: str, user_uuid: str, short_id: str, route: Dict[str, Any], listen: str = "") -> Dict[str, Any]:
     email = client_email_for_route(short_id, protocol)
     return {
         "enable": True,
         "remark": f"{short_id}-{protocol}",
-        "listen": "",
+        "listen": listen,
         "port": route["port"],
         "protocol": protocol,
         "expiryTime": 0,
@@ -2231,6 +2231,7 @@ def insert_inbounds_db(
     user_uuid: str,
     short_id: str,
     routes: List[Dict[str, Any]],
+    listen: str = "",
 ) -> List[int]:
     try:
         conn = sqlite3.connect(db_path)
@@ -2264,7 +2265,7 @@ def insert_inbounds_db(
                     "down": 0,
                     "total": 0,
                     "remark": f"{short_id}-{protocol}",
-                    "listen": "",
+                    "listen": listen,
                     "port": route["port"],
                     "protocol": protocol,
                     "settings": json.dumps(settings, separators=(",", ":")),
@@ -2363,11 +2364,12 @@ def create_inbounds_via_api(
     user_uuid: str,
     short_id: str,
     routes: List[Dict[str, Any]],
+    listen: str = "",
 ) -> List[int]:
     inserted_ids: List[int] = []
     for route in routes:
         protocol = route["protocol"]
-        payload = build_inbound_payload(protocol, user_uuid, short_id, route)
+        payload = build_inbound_payload(protocol, user_uuid, short_id, route, listen=listen)
         created = client.add_inbound(payload)
         inbound_id = created.get("id")
         if inbound_id is None:
@@ -2390,12 +2392,13 @@ def create_inbounds(
     short_id: str,
     routes: List[Dict[str, Any]],
     panel: Optional[XuiPanelClient] = None,
+    listen: str = "",
 ) -> List[int]:
     if backend == BACKEND_API:
         if panel is None:
             exit_error("API 模式需要已登录的面板客户端")
-        return create_inbounds_via_api(panel, user_uuid, short_id, routes)
-    inbound_ids = insert_inbounds_db(DB_PATH, user_uuid, short_id, routes)
+        return create_inbounds_via_api(panel, user_uuid, short_id, routes, listen=listen)
+    inbound_ids = insert_inbounds_db(DB_PATH, user_uuid, short_id, routes, listen=listen)
     restart_xui_service()
     return inbound_ids
 
@@ -2890,12 +2893,18 @@ def run_deploy_install() -> None:
     origin_rules_before = get_origin_rules(zone_id, headers) if transport == "direct" else []
     tunnel_state: Dict[str, Any] = {}
 
+    # Argo Tunnel 模式下，Xray 只监听本机回环地址，避免随机端口直接暴露公网。
+    inbound_listen = "127.0.0.1" if transport == "argo" else ""
+    if transport == "argo":
+        print("Argo Tunnel 模式：Xray 入站自动绑定 127.0.0.1，仅允许 cloudflared 本机转发")
+
     inbound_ids = create_inbounds(
         backend,
         user_uuid=user_uuid,
         short_id=short_id,
         routes=routes,
         panel=panel,
+        listen=inbound_listen,
     )
 
     if transport == "argo":
