@@ -2812,9 +2812,12 @@ def create_fixed_argo_tunnel(
     使用 Account-level Tunnel。account_id 从 Zone API 返回数据中提取。
     """
     create_payload = {"name": tunnel_name}
+    url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels"
+    print(f"  [DEBUG] POST {url}")
+    print(f"  [DEBUG] account_id_len={len(account_id)}")
     result = call_json_api(
         "POST",
-        f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels",
+        url,
         headers=headers,
         data=create_payload,
         exit_on_http_error=False,
@@ -3101,6 +3104,8 @@ def run_deploy_install_argo() -> None:
     account_id = zone.get("account", {}).get("id", "")
     if not account_id:
         exit_error("无法获取 Cloudflare 账户 ID")
+    print(f"  [DEBUG] account_id={account_id}")
+    print(f"  [DEBUG] zone_account={zone.get('account')}")
 
     # 备份 SSL 模式（Argo 隧道需要 Full）
     ssl_before = get_ssl_mode(zone_id, headers)
