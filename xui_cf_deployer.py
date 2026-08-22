@@ -2802,22 +2802,20 @@ def get_public_ipv4_safe() -> str:
         return "127.0.0.1"
 
 
-def _curl_json(email: str, api_key: str, method: str, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """使用 curl 调用 Cloudflare API，返回 JSON 结果。"""
-    cmd = [
-        "curl", "-s",
-        "-X", method,
-        f"{url}",
-        "-H", f"X-Auth-Email: {email}",
-        "-H", f"X-Auth-Key: {api_key}",
-        "-H", "Content-Type: application/json",
-        "-d", json.dumps(data, ensure_ascii=False),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+def _cf_post_json(url: str, headers: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]:
+    """使用 urllib 直接 POST JSON 到 Cloudflare API（绕过 call_json_api 的空 body 404 问题）。"""
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {"success": False, "errors": [{"message": result.stdout or result.stderr or "curl failed"}]}
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        print(f"  [API ERROR] HTTP {e.code} {err_body[:500]}")
+        try:
+            return json.loads(err_body)
+        except json.JSONDecodeError:
+            return {"success": False, "errors": [{"message": f"HTTP {e.code}: {err_body}"}]}
 
 
 def create_fixed_argo_tunnel(
@@ -2829,19 +2827,18 @@ def create_fixed_argo_tunnel(
     创建固定 Argo 隧道，返回 (tunnel_id, tunnel_token)。
     使用 Account-level Tunnel。account_id 从 Zone API 返回数据中提取。
     """
-    cf_email = headers.get("X-Auth-Email", "")
-    cf_key = headers.get("X-Auth-Key", "")
-
     url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels"
-    result = _curl_json(cf_email, cf_key, "POST", url, {"name": tunnel_name})
+    print(f"  正在创建隧道: {tunnel_name}")
+    result = _cf_post_json(url, headers, {"name": tunnel_name})
     if not result.get("success"):
         errs = result.get("errors") or [{"message": "创建 Argo Tunnel 失败"}]
         print(json.dumps(errs, ensure_ascii=False))
         sys.exit(1)
     tunnel_id = str(result["result"]["id"])
+    print(f"  隧道创建成功: {tunnel_id}")
 
     url2 = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}/credentials"
-    token_result = _curl_json(cf_email, cf_key, "POST", url2, {"type": "tunnel"})
+    token_result = _cf_post_json(url2, headers, {"type": "tunnel"})
     if not token_result.get("success"):
         errs = token_result.get("errors") or [{"message": "获取 Tunnel Token 失败"}]
         print(json.dumps(errs, ensure_ascii=False))
@@ -3219,12 +3216,8 @@ def run_uninstall_argo() -> None:
     if route_id:
         try:
             url = f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes/{route_id}"
-            cmd = [
-                "curl", "-s", "-X", "DELETE", url,
-                "-H", f"X-Auth-Email: {cf_email}",
-                "-H", f"X-Auth-Key: {cf_key}",
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=15)
+            req = urllib.request.Request(url, method="DELETE", headers=headers)
+            urllib.request.urlopen(req)
             print(f"已删除 DNS 路由: {route_id}")
         except Exception as e:
             print(f"删除 DNS 路由失败: {e}")
@@ -3233,12 +3226,8 @@ def run_uninstall_argo() -> None:
     if tunnel_id:
         try:
             url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}"
-            cmd = [
-                "curl", "-s", "-X", "DELETE", url,
-                "-H", f"X-Auth-Email: {cf_email}",
-                "-H", f"X-Auth-Key: {cf_key}",
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=15)
+            req = urllib.request.Request(url, method="DELETE", headers=headers)
+            urllib.request.urlopen(req)
             print(f"已删除 Argo 隧道: {tunnel_id}")
         except Exception as e:
             print(f"删除 Argo 隧道失败: {e}")
