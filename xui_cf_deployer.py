@@ -2,7 +2,6 @@
 import http.cookiejar
 import ipaddress
 import json
-import base64
 import os
 import random
 import re
@@ -38,14 +37,18 @@ DEPLOYER_INSTALL_PATH = "/usr/local/lib/cf-deployer/xui_cf_deployer.py"
 XUI_INSTALL_URL = "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
 XUI_INSTALL_STDIN = "\nn\n4\n\n"
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
-
-# ========== Argo 隧道配置 ==========
-ARGO_TUNNEL_DIR = "/etc/x-ui/argo"
-ARGO_TUNNEL_TOKEN_PATH = os.path.join(ARGO_TUNNEL_DIR, "tunnel_token.json")
-ARGO_TUNNEL_CONFIG_PATH = os.path.join(ARGO_TUNNEL_DIR, "cloudflared.json")
-ARGO_TUNNEL_SERVICE_NAME = "cloudflared-argo"
-ARGO_TUNNEL_CNAME_PREFIX = "cfargotunnel.com"
-CF_TUNNELS_API_BASE = "https://api.cloudflare.com/client/v4"
+CLOUDFLARED_BIN = "/usr/local/bin/cloudflared"
+CLOUDFLARED_SERVICE = "cloudflared"
+CLOUDFLARED_VERSION_URLS = {
+    "x86_64": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+    "amd64": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+    "aarch64": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+    "arm64": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+    "armv7l": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm",
+    "armv6l": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm",
+    "i386": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386",
+    "i686": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386",
+}
 DEFAULT_PANEL_URL = "http://127.0.0.1:2053"
 PORT_MIN = 10000
 PORT_MAX = 60000
@@ -723,6 +726,7 @@ def print_xui_management_help() -> None:
         "",
         "CF 部署器快捷命令：",
         "  cfd                     再次打开本脚本",
+        "  cfd argo                查看当前 Argo Tunnel 状态",
         "",
         "进入 x-ui 交互菜单后，还可修改端口、重置密码、SSL 证书等。",
         "",
@@ -736,7 +740,6 @@ def print_xui_management_help() -> None:
 def build_mode_menu_items() -> List[Tuple[str, str]]:
     items: List[Tuple[str, str]] = [
         ("install", "安装节点"),
-        ("install_argo", "安装节点(Argo隧道)"),
         ("uninstall", "卸载"),
         ("show", "查看订阅"),
     ]
@@ -746,6 +749,9 @@ def build_mode_menu_items() -> List[Tuple[str, str]]:
         items.append(("panel", "查看面板"))
     if is_xui_installed():
         items.append(("xui_manage", "面板管理命令"))
+    current_state = load_last_state()
+    if current_state and isinstance(current_state.get("tunnel"), dict):
+        items.append(("argo", "Argo Tunnel 管理"))
     return items
 
 
@@ -770,10 +776,6 @@ def parse_mode(raw: str, items: Optional[List[Tuple[str, str]]] = None) -> str:
         "install": "install",
         "i": "install",
         "安装": "install",
-        "argo": "install_argo",
-        "隧道": "install_argo",
-        "固定隧道": "install_argo",
-        "argo隧道": "install_argo",
         "uninstall": "uninstall",
         "u": "uninstall",
         "卸载": "uninstall",
@@ -795,6 +797,11 @@ def parse_mode(raw: str, items: Optional[List[Tuple[str, str]]] = None) -> str:
         "管理": "xui_manage",
         "管理命令": "xui_manage",
         "面板管理": "xui_manage",
+        "argo": "argo",
+        "tunnel": "argo",
+        "argo tunnel": "argo",
+        "隧道": "argo",
+        "argo管理": "argo",
     }
     mode_id = aliases.get(text)
     if mode_id and any(item[0] == mode_id for item in menu):
@@ -1230,6 +1237,206 @@ def fetch_all_zones(headers: Dict[str, str]) -> List[Dict[str, Any]]:
             break
         page += 1
     return zones
+
+
+def get_dns_record_any(zone_id: str, domain: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """读取指定 hostname 的 A/AAAA/CNAME 记录，用于 Argo Tunnel 切换与回滚。"""
+    q = parse.urlencode({"name": domain})
+    existing = call_cf_api("GET", f"/zones/{zone_id}/dns_records?{q}", headers=headers)
+    if existing:
+        preferred = [x for x in existing if str(x.get("type", "")).upper() in ("A", "AAAA", "CNAME")]
+        return preferred[0] if preferred else existing[0]
+    return None
+
+
+def get_account_id_from_zone(zone: Dict[str, Any]) -> str:
+    account = zone.get("account") or {}
+    account_id = str(account.get("id") or "").strip()
+    if account_id:
+        return account_id
+    exit_error("无法从 Cloudflare Zone 获取 Account ID")
+
+
+def cloudflared_download_url() -> str:
+    machine = os.uname().machine.lower()
+    url = CLOUDFLARED_VERSION_URLS.get(machine)
+    if not url:
+        exit_error(f"暂不支持自动安装 cloudflared 的 CPU 架构: {machine}")
+    return url
+
+
+def ensure_cloudflared() -> str:
+    existing = shutil.which("cloudflared")
+    if existing:
+        return existing
+    if os.path.isfile(CLOUDFLARED_BIN):
+        os.chmod(CLOUDFLARED_BIN, 0o755)
+        return CLOUDFLARED_BIN
+
+    if os.geteuid() != 0:
+        exit_error("安装 Argo Tunnel 需要 root 权限")
+    url = cloudflared_download_url()
+    print(f"正在安装 cloudflared: {url}")
+    try:
+        with request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+        if not data:
+            exit_error("下载 cloudflared 失败：文件为空")
+        with open(CLOUDFLARED_BIN, "wb") as f:
+            f.write(data)
+        os.chmod(CLOUDFLARED_BIN, 0o755)
+    except (OSError, error.URLError) as e:
+        exit_error(f"下载 cloudflared 失败: {e}")
+    return CLOUDFLARED_BIN
+
+
+def create_cloudflare_tunnel(
+    account_id: str,
+    name: str,
+    headers: Dict[str, str],
+) -> Tuple[str, str]:
+    result = call_cf_api(
+        "POST",
+        f"/accounts/{account_id}/cfd_tunnel",
+        headers=headers,
+        data={"name": name, "config_src": "cloudflare"},
+    )
+    tunnel_id = str(result.get("id") or "").strip()
+    if not tunnel_id:
+        exit_error("Cloudflare Tunnel 创建成功但未返回 tunnel id")
+    token_result = call_cf_api(
+        "GET",
+        f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token",
+        headers=headers,
+    )
+    token = str(token_result or "").strip()
+    if not token:
+        exit_error("Cloudflare Tunnel 创建成功但未获取到 tunnel token")
+    return tunnel_id, token
+
+
+def configure_cloudflare_tunnel(
+    account_id: str,
+    tunnel_id: str,
+    domain: str,
+    routes: List[Dict[str, Any]],
+    headers: Dict[str, str],
+) -> None:
+    ingress: List[Dict[str, Any]] = []
+    for route in routes:
+        ingress.append(
+            {
+                "hostname": domain,
+                "path": route["path"],
+                "service": f"http://127.0.0.1:{route['port']}",
+                "originRequest": {},
+            }
+        )
+    # Cloudflare Tunnel ingress 必须有 catch-all 规则。
+    ingress.append({"service": "http_status:404"})
+    call_cf_api(
+        "PUT",
+        f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+        headers=headers,
+        data={"config": {"ingress": ingress}},
+    )
+
+
+def install_cloudflared_service(cloudflared: str, token: str) -> None:
+    # token 不写入 shell，避免 shell quoting/历史记录问题。
+    try:
+        subprocess.run(
+            [cloudflared, "service", "uninstall"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        result = subprocess.run(
+            [cloudflared, "service", "install", token],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        exit_error(f"安装 cloudflared 服务失败: {e}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        exit_error(f"安装 cloudflared 服务失败: {detail[-2000:]}")
+    try:
+        subprocess.run(
+            ["systemctl", "enable", "--now", CLOUDFLARED_SERVICE],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        exit_error(f"启动 cloudflared 服务失败: {e}")
+
+
+def uninstall_cloudflared_service() -> None:
+    cloudflared = shutil.which("cloudflared") or (CLOUDFLARED_BIN if os.path.isfile(CLOUDFLARED_BIN) else "")
+    if not cloudflared:
+        return
+    try:
+        subprocess.run(
+            [cloudflared, "service", "uninstall"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def delete_cloudflare_tunnel(account_id: str, tunnel_id: str, headers: Dict[str, str]) -> None:
+    if not account_id or not tunnel_id:
+        return
+    call_cf_api(
+        "DELETE",
+        f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}",
+        headers=headers,
+    )
+
+
+def upsert_tunnel_dns_record(
+    zone_id: str,
+    domain: str,
+    tunnel_id: str,
+    headers: Dict[str, str],
+) -> str:
+    existing = get_dns_record_any(zone_id, domain, headers)
+    payload = {
+        "type": "CNAME",
+        "name": domain,
+        "content": f"{tunnel_id}.cfargotunnel.com",
+        "proxied": True,
+        "ttl": 1,
+    }
+    if existing:
+        record_id = str(existing.get("id") or "").strip()
+        if not record_id:
+            exit_error("Cloudflare DNS 记录缺少 id，无法切换到 Tunnel")
+        call_cf_api(
+            "PUT",
+            f"/zones/{zone_id}/dns_records/{record_id}",
+            headers=headers,
+            data=payload,
+        )
+        return record_id
+    created = call_cf_api(
+        "POST",
+        f"/zones/{zone_id}/dns_records",
+        headers=headers,
+        data=payload,
+    )
+    return str(created["id"])
 
 
 def get_dns_record(zone_id: str, domain: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
@@ -2537,7 +2744,7 @@ def restore_dns_record(
     if existed:
         record_id = str(record.get("id", "")).strip()
         if not record_id:
-            current = get_dns_record(zone_id, domain, headers)
+            current = get_dns_record_any(zone_id, domain, headers)
             if current:
                 record_id = str(current.get("id", "")).strip()
         if not record_id:
@@ -2549,6 +2756,8 @@ def restore_dns_record(
             "proxied": bool(record.get("proxied", False)),
             "ttl": int(record.get("ttl", 1)),
         }
+        if str(payload["type"]).upper() not in ("A", "AAAA", "CNAME"):
+            payload["type"] = "A"
         if not payload["content"]:
             return
         call_cf_api("PUT", f"/zones/{zone_id}/dns_records/{record_id}", headers=headers, data=payload)
@@ -2574,12 +2783,22 @@ def uninstall_last_config(
     if not domain or not zone_id:
         exit_error("上次配置缺少 domain 或 zone_id，无法卸载")
 
-    current_rules = get_origin_rules(zone_id, headers)
-    put_origin_rules(zone_id, headers, strip_managed_origin_rules(current_rules, domain))
+    transport = str(state.get("transport") or "direct").strip().lower()
+    tunnel = state.get("tunnel") or {}
+    if transport == "argo" and isinstance(tunnel, dict):
+        uninstall_cloudflared_service()
+        delete_cloudflare_tunnel(
+            str(tunnel.get("account_id") or "").strip(),
+            str(tunnel.get("tunnel_id") or "").strip(),
+            headers,
+        )
+    else:
+        current_rules = get_origin_rules(zone_id, headers)
+        put_origin_rules(zone_id, headers, strip_managed_origin_rules(current_rules, domain))
 
-    ssl_backup = str(state.get("ssl_backup", "")).strip()
-    if ssl_backup:
-        set_ssl_mode(zone_id, headers, ssl_backup)
+        ssl_backup = str(state.get("ssl_backup", "")).strip()
+        if ssl_backup:
+            set_ssl_mode(zone_id, headers, ssl_backup)
 
     restore_dns_record(
         zone_id=zone_id,
@@ -2656,10 +2875,20 @@ def run_deploy_install() -> None:
         exit_error(f"无法匹配该域名对应的 Zone: {domain}")
 
     zone_id = zone["id"]
-    public_ip = get_public_ipv4()
-    dns_before = get_dns_record(zone_id, domain, headers)
-    ssl_before = get_ssl_mode(zone_id, headers)
-    origin_rules_before = get_origin_rules(zone_id, headers)
+    transport = os.environ.get("CF_TUNNEL_MODE", "").strip().lower()
+    if transport not in ("argo", "tunnel", "origin", "direct"):
+        print("\nCloudflare 接入方式:")
+        print("  1. 传统模式：A 记录 + Origin Rules")
+        print("  2. Argo Tunnel：cloudflared 出站隧道，无需开放节点入站端口")
+        raw_transport = input("选择(1/2，回车=1): ").strip().lower()
+        transport = "argo" if raw_transport in ("2", "argo", "tunnel") else "direct"
+    else:
+        transport = "argo" if transport in ("argo", "tunnel") else "direct"
+
+    dns_before = get_dns_record_any(zone_id, domain, headers)
+    ssl_before = get_ssl_mode(zone_id, headers) if transport == "direct" else ""
+    origin_rules_before = get_origin_rules(zone_id, headers) if transport == "direct" else []
+    tunnel_state: Dict[str, Any] = {}
 
     inbound_ids = create_inbounds(
         backend,
@@ -2669,9 +2898,51 @@ def run_deploy_install() -> None:
         panel=panel,
     )
 
-    managed_dns_record_id = upsert_dns_record(zone_id, domain, public_ip, headers)
-    set_ssl_mode(zone_id, headers, "flexible")
-    apply_origin_rules(zone_id, headers, domain, routes)
+    if transport == "argo":
+        account_id = get_account_id_from_zone(zone)
+        tunnel_name = f"xui-{short_id}"
+        print(f"正在创建 Cloudflare Argo Tunnel: {tunnel_name}")
+        tunnel_id, tunnel_token = create_cloudflare_tunnel(account_id, tunnel_name, headers)
+        try:
+            configure_cloudflare_tunnel(account_id, tunnel_id, domain, routes, headers)
+            managed_dns_record_id = upsert_tunnel_dns_record(zone_id, domain, tunnel_id, headers)
+            cloudflared = ensure_cloudflared()
+            install_cloudflared_service(cloudflared, tunnel_token)
+        except BaseException:
+            # 部署中途失败时尽量恢复 DNS、删除 Tunnel，并删除刚创建的 x-ui 入站。
+            try:
+                restore_dns_record(
+                    zone_id=zone_id,
+                    domain=domain,
+                    headers=headers,
+                    dns_backup={"existed": dns_before is not None, "record": dns_before},
+                    managed_dns_record_id=locals().get("managed_dns_record_id", ""),
+                )
+            except BaseException:
+                pass
+            try:
+                delete_cloudflare_tunnel(account_id, tunnel_id, headers)
+            except BaseException:
+                pass
+            try:
+                delete_managed_inbounds(backend, inbound_ids, [f"{short_id}-{p}" for p in selected_protocols], panel=panel)
+            except BaseException:
+                pass
+            raise
+        tunnel_state = {
+            "account_id": account_id,
+            "tunnel_id": tunnel_id,
+            "name": tunnel_name,
+            "hostname": domain,
+            "config_src": "cloudflare",
+        }
+        print(f"Argo Tunnel 已创建: {tunnel_id}")
+        print("cloudflared 服务已安装并启动")
+    else:
+        public_ip = get_public_ipv4()
+        managed_dns_record_id = upsert_dns_record(zone_id, domain, public_ip, headers)
+        set_ssl_mode(zone_id, headers, "flexible")
+        apply_origin_rules(zone_id, headers, domain, routes)
 
     links = build_links(user_uuid, domain, routes)
     save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)
@@ -2681,6 +2952,7 @@ def run_deploy_install() -> None:
         {
             "version": state_version,
             "backend": backend,
+            "transport": transport,
             "domain": domain,
             "zone_id": zone_id,
             "uuid": user_uuid,
@@ -2695,6 +2967,7 @@ def run_deploy_install() -> None:
             },
             "ssl_backup": ssl_before,
             "origin_rules_backup": origin_rules_before,
+            "tunnel": tunnel_state,
             "links": links,
             "selected_protocols": selected_protocols,
         }
@@ -2706,8 +2979,47 @@ def run_deploy_install() -> None:
         print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
 
 
+def print_argo_tunnel_status(state: Dict[str, Any], headers: Dict[str, str]) -> None:
+    tunnel = state.get("tunnel") or {}
+    account_id = str(tunnel.get("account_id") or "").strip()
+    tunnel_id = str(tunnel.get("tunnel_id") or "").strip()
+    domain = str(state.get("domain") or "").strip()
+    if not account_id or not tunnel_id:
+        exit_error("当前状态缺少 Argo Tunnel 信息")
+    result = call_cf_api_result(
+        "GET",
+        f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}",
+        headers=headers,
+    )
+    if result.get("success"):
+        obj = result.get("result") or {}
+        print(f"Argo Tunnel: {obj.get('name') or tunnel_id}")
+        print(f"ID: {tunnel_id}")
+        print(f"状态: {obj.get('status') or 'unknown'}")
+        print(f"域名: {domain}")
+    else:
+        print(f"无法读取 Tunnel 状态: {json.dumps(result.get('errors') or result, ensure_ascii=False)}")
+
+
+def manage_argo_tunnel(state: Dict[str, Any]) -> None:
+    tunnel = state.get("tunnel") or {}
+    if not isinstance(tunnel, dict):
+        exit_error("当前没有 Argo Tunnel 配置")
+    cf_email, cf_key = prompt_cf_credentials()
+    headers = build_cf_headers(cf_email, cf_key)
+    print_argo_tunnel_status(state, headers)
+    print("cloudflared 服务: " + ("已安装" if shutil.which("cloudflared") or os.path.isfile(CLOUDFLARED_BIN) else "未安装"))
+    print("提示：Argo Tunnel 的入口配置由 Cloudflare 远程管理，本脚本已按节点 path 映射到本机 3x-ui 端口。")
+
+
 def main() -> None:
     ensure_cfd_command()
+    if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("argo", "tunnel"):
+        state = load_last_state()
+        if not state or not isinstance(state.get("tunnel"), dict):
+            exit_error("未检测到 Argo Tunnel 配置")
+        manage_argo_tunnel(state)
+        return
     mode = select_mode_interactive()
     prompt_maybe_localize_xui_menu()
     last_state = load_last_state()
@@ -2729,15 +3041,15 @@ def main() -> None:
         print_xui_management_help()
         return
 
+    if mode == "argo":
+        if last_state is None or not isinstance(last_state.get("tunnel"), dict):
+            exit_error("未检测到 Argo Tunnel 配置")
+        manage_argo_tunnel(last_state)
+        return
+
     if mode == "show":
         maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
         print_last_links()
-        return
-
-    if mode == "install_argo":
-        if not is_xui_installed():
-            exit_error("未检测到 3x-ui，请使用模式 4(全新安装)")
-        run_deploy_install_argo()
         return
 
     if mode == "uninstall":
@@ -2760,578 +3072,7 @@ def main() -> None:
 
     run_deploy_install()
     return
-    # ========== 固定 Argo 隧道功能 ==========
-def ensure_argo_tunnel_dir() -> None:
-    os.makedirs(ARGO_TUNNEL_DIR, exist_ok=True)
 
 
-def load_argo_tunnel_state() -> Optional[Dict[str, Any]]:
-    path = ARGO_TUNNEL_TOKEN_PATH
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def save_argo_tunnel_state(state: Dict[str, Any]) -> None:
-    ensure_argo_tunnel_dir()
-    try:
-        with open(ARGO_TUNNEL_TOKEN_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        os.chmod(ARGO_TUNNEL_TOKEN_PATH, 0o600)
-    except OSError as e:
-        exit_error(f"保存 Argo 隧道配置失败: {e}")
-
-
-def get_public_ipv4_safe() -> str:
-    """安全获取公网 IPv4，失败时回退到 hostname。"""
-    for url in ("https://api.ipify.org", "https://ipv4.icanhazip.com"):
-        try:
-            with request.urlopen(url, timeout=8) as resp:
-                ip_text = resp.read().decode("utf-8").strip()
-            ipaddress.IPv4Address(ip_text)
-            return ip_text
-        except Exception:
-            continue
-    try:
-        return request.gethostbyname(request.gethostname())
-    except Exception:
-        return "127.0.0.1"
-
-
-def _cf_post_json(url: str, headers: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]:
-    """使用 curl POST JSON 到 Cloudflare API（urllib 在某些端点返回空 body 404）。"""
-    email = headers.get("X-Auth-Email", "")
-    key = headers.get("X-Auth-Key", "")
-    body = json.dumps(data, ensure_ascii=False)
-    cmd = [
-        "curl", "-s", "-X", "POST", url,
-        "-H", f"X-Auth-Email: {email}",
-        "-H", f"X-Auth-Key: {key}",
-        "-H", "Content-Type: application/json",
-        "-d", body,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    stdout = result.stdout.strip()
-    stderr = result.stderr.strip()
-    if not stdout and stderr:
-        print(f"  [API ERROR] curl stderr: {stderr[:300]}")
-    try:
-        return json.loads(stdout) if stdout else {"success": False, "errors": [{"message": "empty response"}]}
-    except json.JSONDecodeError:
-        print(f"  [API ERROR] raw: {stdout[:200] or stderr[:200]}")
-        return {"success": False, "errors": [{"message": stdout or stderr or "curl failed"}]}
-
-
-def create_fixed_argo_tunnel(
-    account_id: str,
-    headers: Dict[str, str],
-    tunnel_name: str,
-) -> Tuple[str, str]:
-    """
-    创建固定 Argo 隧道，返回 (tunnel_id, tunnel_token)。
-    使用 Account-level Tunnel。token 直接从创建响应中获取。
-    account_id 从 Zone API 返回数据中提取。
-    """
-    url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels"
-    print(f"  正在创建隧道: {tunnel_name}")
-    result = _cf_post_json(url, headers, {"name": tunnel_name})
-    if not result.get("success"):
-        errs = result.get("errors") or [{"message": "创建 Argo Tunnel 失败"}]
-        print(json.dumps(errs, ensure_ascii=False))
-        sys.exit(1)
-    tunnel_id = str(result["result"]["id"])
-    print(f"  隧道创建成功: {tunnel_id}")
-
-    # 从创建响应中直接获取 tunnel token（API 会返回 credentials_file.token）
-    tunnel_token = str(result["result"].get("token", ""))
-    if not tunnel_token:
-        exit_error("隧道创建成功但未返回 token")
-    print(f"  Token 获取成功")
-
-    return tunnel_id, tunnel_token
-
-
-def create_argo_tunnel_route(
-    zone_id: str,
-    domain: str,
-    tunnel_id: str,
-    headers: Dict[str, str],
-) -> str:
-    """
-    为隧道创建 CNAME DNS 记录指向 cfargotunnel.com。
-    Account-level Tunnel 使用 CNAME 方式路由（不支持 tunnel_routes 的 zone 也适用）。
-    返回 DNS record id。
-    """
-    target = f"{tunnel_id}.cfargotunnel.com"
-    print(f"  正在配置 DNS: {domain} -> {target}")
-
-    dns_payload = {
-        "type": "CNAME",
-        "name": domain,
-        "content": target,
-        "ttl": 1,
-        "proxied": True,
-    }
-
-    # 尝试创建，如果已存在则更新
-    result = call_json_api(
-        "POST",
-        f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/dns_records",
-        headers=headers,
-        data=dns_payload,
-        exit_on_http_error=False,
-    )
-    if result.get("success"):
-        record_id = str(result["result"]["id"])
-        print(f"  DNS CNAME 创建成功: {domain} -> {target}")
-        return record_id
-
-    # 如果已存在，更新
-    errs = result.get("errors", [])
-    existing_ids = []
-    for e in errs:
-        msg = e.get("message", "")
-        if "already exists" in msg or "record already" in msg:
-            existing_ids.append(e)
-    if existing_ids:
-        # 用 GET 查找已有记录
-        q = parse.urlencode({"type": "CNAME", "name": domain})
-        existing = call_cf_api("GET", f"/zones/{zone_id}/dns_records?{q}", headers=headers)
-        if existing:
-            rec = existing[0]
-            rec_id = str(rec["id"])
-            update_payload = {"content": target, "ttl": 1, "proxied": True}
-            call_json_api(
-                "PUT",
-                f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/dns_records/{rec_id}",
-                headers=headers,
-                data=update_payload,
-            )
-            print(f"  DNS CNAME 已更新: {domain} -> {target}")
-            return rec_id
-
-    # 其他错误
-    print(json.dumps(errs, ensure_ascii=False))
-    sys.exit(1)
-
-
-def build_cloudflared_config(
-    tunnel_id: str,
-    routes: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """生成 cloudflared 配置文件。"""
-    tunnel_routes = []
-    for route in routes:
-        path = route["path"]
-        port = str(route["port"])
-        tunnel_routes.append(
-            {
-                "service": f"http://127.0.0.1:{port}",
-                "path": f"/{path.lstrip('/')}/",
-            }
-        )
-    # 如果只有一条路由，简化配置
-    config = {
-        "tunnel": tunnel_id,
-
-        "port": 2000,
-        "loglevel": "info",
-        "protocol": "quic",
-        "transport": {"connect": "wss://relay.cloudflare.com:2048"},
-        "metrics": "127.0.0.1:2001",
-        "grace-period": "2m",
-        "ingress": [],
-    }
-    # ingress 配置（按协议路径区分）
-    ingress_routes = []
-    for route in routes:
-        path = route["path"].lstrip("/")
-        ingress_routes.append(
-            {
-                "hostname": "*",
-                "service": f"http://127.0.0.1:{route['port']}",
-                "path": [f"/{path}"],
-                "originRequest": {
-                    "noTLSVerify": True,
-                    "connectTimeout": "30s",
-                    "keepAliveTimeout": "0s",
-                    "noH2": True,
-                },
-            }
-        )
-    ingress_routes.append({"service": "http_status:404"})
-    config["ingress"] = ingress_routes
-    return config
-
-
-def save_cloudflared_config(config: Dict[str, Any]) -> None:
-    ensure_argo_tunnel_dir()
-    try:
-        with open(ARGO_TUNNEL_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        os.chmod(ARGO_TUNNEL_CONFIG_PATH, 0o600)
-    except OSError as e:
-        exit_error(f"保存 cloudflared 配置失败: {e}")
-
-
-def install_cloudflared_binary() -> Optional[str]:
-    """
-    下载并安装 cloudflared 二进制文件。
-    优先用官方脚本安装为 systemd service。
-    """
-    cfd_path = shutil.which("cloudflared")
-    if cfd_path and os.path.isfile(cfd_path):
-        try:
-            result = subprocess.run(
-                [cfd_path, "version"],
-                capture_output=True, text=True, timeout=8, check=False,
-            )
-            if result.returncode == 0:
-                print(f"cloudflared 已安装: {cfd_path}")
-                return cfd_path
-        except Exception:
-            pass
-
-    print("正在安装 cloudflared...")
-    try:
-        result = subprocess.run(
-            ["bash", "-c", "curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"],
-            capture_output=True, text=True, timeout=600, check=False,
-        )
-        if result.returncode != 0:
-            # 备用：使用官方安装脚本
-            result2 = subprocess.run(
-                ["bash", "-c", "curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"],
-                capture_output=True, text=True, timeout=600, check=False,
-            )
-            if result2.returncode != 0:
-                print(f"cloudflared 安装失败: {result2.stderr[:500]}")
-                return None
-        cfd_path = "/usr/local/bin/cloudflared"
-        if os.path.isfile(cfd_path):
-            print(f"cloudflared 已安装: {cfd_path}")
-            return cfd_path
-    except subprocess.TimeoutExpired:
-        print("cloudflared 下载超时")
-    except Exception as e:
-        print(f"cloudflared 安装异常: {e}")
-    return None
-
-
-
-def setup_argo_tunnel_service(cfd_path: str) -> None:
-    """
-    创建 cloudflared systemd service（如果 systemd 可用）。
-    使用 --token 模式启动（token 直接从 Cloudflare API 返回），不依赖 credentials-file。
-    """
-    if not shutil.which("systemctl"):
-        return
-
-    # 读取隧道 token（从已保存的状态文件中获取）
-    token = ""
-    state = load_argo_tunnel_state()
-    if state:
-        token = state.get("tunnel_token", "")
-
-    if not token:
-        print("\u26a0\ufe0f  未找到隧道 token，cloudflared 服务可能无法正常运行")
-
-    service_file = f"""[Unit]
-Description=Cloudflare Argo Tunnel
-After=network.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart={cfd_path} tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH} --token {token}
-Restart=always
-RestartSec=30
-Environment=NO_AUTOUPDATE=1
-
-[Install]
-WantedBy=multi-user.target
-"""
-    svc_path = f"/etc/systemd/system/{ARGO_TUNNEL_SERVICE_NAME}.service"
-    try:
-        with open(svc_path, "w") as f:
-            f.write(service_file)
-        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, check=False)
-        subprocess.run(["systemctl", "enable", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
-        subprocess.run(["systemctl", "start", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
-        print(f"\u2705 Argo Tunnel 服务已创建: {ARGO_TUNNEL_SERVICE_NAME}")
-    except Exception as e:
-        print(f"\u26a0\ufe0f Argo Tunnel systemd 服务创建失败: {e}")
-        print(f"\u26a0\ufe0f 请手动运行: {cfd_path} tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH} --token {token}")
-
-def build_links_argo(user_uuid: str, domain: str, routes: List[Dict[str, Any]]) -> Dict[str, str]:
-    """
-    使用 Argo 隧道时构建订阅链接（标准代理协议 URI）。
-    域名经 CNAME 指向 cfargotunnel.com，TLS 在 Cloudflare 边缘终止，
-    客户端通过 WebSocket + TLS 连接，cloudflared 转发至 x-ui 入站。
-    端口使用 443（TLS），path 对应 cloudflared ingress 规则。
-    """
-    links = {}
-    for route in routes:
-        protocol = route["protocol"]
-        path_encoded = parse.quote(route["path"].lstrip("/"), safe="")
-        port = 443
-        if protocol == "vless":
-            links[protocol] = (
-                f"vless://{user_uuid}@{domain}:{port}"
-                f"?encryption=none&path=/{path_encoded}&security=tls&type=ws&headerType=none"
-            )
-        elif protocol == "trojan":
-            links[protocol] = (
-                f"trojan://{user_uuid}@{domain}:{port}"
-                f"?encryption=none&path=/{path_encoded}&security=tls&type=ws&headerType=none"
-            )
-        elif protocol == "vmess":
-            vmess_config = {
-                "v": "2",
-                "ps": f"vmess-argo-{domain}",
-                "add": domain,
-                "port": str(port),
-                "id": user_uuid,
-                "aid": "0",
-                "net": "ws",
-                "type": "none",
-                "host": "",
-                "path": route["path"],
-                "tls": "tls",
-            }
-            vmess_json = json.dumps(vmess_config, ensure_ascii=False)
-            links[protocol] = f"vmess://{base64.b64encode(vmess_json.encode()).decode()}"
-    return links
-
-
-def run_deploy_install_argo() -> None:
-    """
-    使用固定 Argo 隧道部署节点（完整流程）。
-    """
-    last_state = load_last_state()
-    backend, runtime, reason = resolve_backend()
-    print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
-    panel = None
-    if backend == BACKEND_DB:
-        if not os.path.exists(DB_PATH):
-            exit_error(f"未找到 3x-ui 数据库: {DB_PATH}")
-        normalize_existing_inbound_client_email(DB_PATH)
-        maybe_repair_v3_client_bindings(DB_PATH, "install", last_state)
-    else:
-        panel = setup_panel_client(runtime, interactive=False)
-
-    if last_state is not None:
-        last_domain = str(last_state.get("domain", "未知域名"))
-        exit_error(f"检测到上次配置({last_domain})，请先执行卸载")
-
-    domain = input("绑定域名: ").strip()
-    cf_email, cf_key = prompt_cf_credentials()
-    selected_protocols = parse_protocol_selection(
-        input("创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): ")
-    )
-
-    if not domain or not cf_email or not cf_key or not selected_protocols:
-        exit_error("域名、邮箱、API Key 和协议选项不能为空")
-
-    user_uuid = str(uuid.uuid4())
-    short_id = user_uuid[:8]
-    tunnel_name = f"{short_id}-argo"
-
-    # 生成端口和路径（Argo 模式下端口仅用于本地，不需要公网访问）
-    if backend == BACKEND_API:
-        existing_ports = load_existing_ports_api(panel)  # type: ignore[arg-type]
-    else:
-        try:
-            with sqlite3.connect(DB_PATH) as conn:
-                existing_ports = load_existing_ports_db(conn)
-        except sqlite3.Error as e:
-            exit_error(str(e))
-    ports = random_ports(len(selected_protocols), existing_ports)
-    routes = []
-    for i, protocol in enumerate(selected_protocols):
-        routes.append(
-            {
-                "protocol": protocol,
-                "port": ports[i],
-                "path": f"/{short_id}-{PROTOCOL_SUFFIX[protocol]}",
-            }
-        )
-
-    headers = build_cf_headers(cf_email, cf_key)
-
-    # 匹配 Zone
-    zones = fetch_all_zones(headers)
-    zone = find_best_zone(domain, zones)
-    if zone is None:
-        exit_error(f"无法匹配该域名对应的 Zone: {domain}")
-    zone_id = zone["id"]
-    account_id = zone.get("account", {}).get("id", "")
-    if not account_id:
-        exit_error("无法获取 Cloudflare 账户 ID")
-
-    # 备份 SSL 模式（Argo 隧道需要 Full）
-    ssl_before = get_ssl_mode(zone_id, headers)
-
-    # 创建 x-ui 入站
-    inbound_ids = create_inbounds(
-        backend,
-        user_uuid=user_uuid,
-        short_id=short_id,
-        routes=routes,
-        panel=panel,
-    )
-
-    # ===== 核心：创建固定 Argo 隧道 =====
-    print(f"\n>>> 创建 Argo 隧道: {tunnel_name}")
-    tunnel_id, tunnel_token = create_fixed_argo_tunnel(account_id, headers, tunnel_name)
-    print(f"    Tunnel ID: {tunnel_id}")
-
-    # 创建 DNS 路由
-    print(">>> 配置 DNS 路由...")
-    route_id = create_argo_tunnel_route(zone_id, domain, tunnel_id, headers)
-
-    # 设置 SSL 模式为 Full
-    set_ssl_mode(zone_id, headers, "full")
-
-    # 生成并保存 cloudflared 配置
-    cf_config = build_cloudflared_config(tunnel_id, routes)
-    save_cloudflared_config(cf_config)
-
-    # 保存隧道凭据
-    save_argo_tunnel_state({
-        "tunnel_id": tunnel_id,
-        "tunnel_name": tunnel_name,
-        "tunnel_token": tunnel_token,
-        "tunnel_route_id": route_id,
-        "domain": domain,
-        "zone_id": zone_id,
-        "uuid": user_uuid,
-        "short_id": short_id,
-        "routes": routes,
-        "inbound_ids": inbound_ids,
-        "tags": [f"{short_id}-{p}" for p in selected_protocols],
-        "ssl_backup": ssl_before,
-        "links": {},  # 稍后填充
-        "selected_protocols": selected_protocols,
-        "argo_mode": True,
-    })
-
-    # 安装 cloudflared
-    cfd_path = install_cloudflared_binary()
-    if cfd_path:
-        setup_argo_tunnel_service(cfd_path)
-    else:
-        print("⚠️ cloudflared 安装失败，请手动安装并运行隧道")
-
-    # 生成订阅链接
-    links = build_links_argo(user_uuid, domain, routes)
-    save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)
-
-    # 更新状态文件中的链接
-    state_data = load_argo_tunnel_state() or {}
-    state_data["links"] = links
-    save_argo_tunnel_state(state_data)
-
-    print("\n✅ Argo 隧道部署完成")
-    print(f"域名: {domain}")
-    print(f"Tunnel: {tunnel_name} ({tunnel_id})")
-    print(f"配置文件: {ARGO_TUNNEL_CONFIG_PATH}")
-    print(f"下次运行: cloudflared tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH}")
-    for protocol in selected_protocols:
-        link = links.get(protocol, "")
-        if link:
-            print(f"{PROTOCOL_LABEL[protocol]}链接: {link}")
-    print(f"订阅已保存到: {LAST_LINKS_PATH}")
-
-
-def run_uninstall_argo() -> None:
-    """卸载 Argo 隧道配置。"""
-    state = load_argo_tunnel_state()
-    if not state:
-        exit_error("未检测到 Argo 隧道配置")
-
-    tunnel_id = str(state.get("tunnel_id", ""))
-    zone_id = str(state.get("zone_id", ""))
-    route_id = str(state.get("tunnel_route_id", ""))
-
-    cf_email, cf_key = prompt_cf_credentials()
-    headers = build_cf_headers(cf_email, cf_key)
-
-    # 获取 account_id
-    zones = fetch_all_zones(headers)
-    account_id = ""
-    for z in zones:
-        if z.get("id") == zone_id:
-            account_id = z.get("account", {}).get("id", "")
-            break
-    if not account_id:
-        exit_error("无法获取 Cloudflare 账户 ID")
-
-    # 停止 cloudflared 服务
-    if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "stop", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
-        subprocess.run(["systemctl", "disable", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
-
-    # 删除 DNS 记录
-    if route_id:
-        try:
-            url = f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/dns_records/{route_id}"
-            req = request.Request(url, method="DELETE", headers=headers)
-            request.urlopen(req)
-            print(f"已删除 DNS 记录: {route_id}")
-        except Exception as e:
-            print(f"删除 DNS 记录失败: {e}")
-
-    # 删除 Tunnel
-    if tunnel_id:
-        try:
-            url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}"
-            req = request.Request(url, method="DELETE", headers=headers)
-            request.urlopen(req)
-            print(f"已删除 Argo 隧道: {tunnel_id}")
-        except Exception as e:
-            print(f"删除 Argo 隧道失败: {e}")
-
-    # 恢复 SSL 模式
-    ssl_backup = str(state.get("ssl_backup", ""))
-    if ssl_backup:
-        try:
-            set_ssl_mode(zone_id, headers, ssl_backup)
-        except Exception:
-            pass
-
-    # 删除 x-ui 入站
-    inbound_ids = [int(x) for x in state.get("inbound_ids", [])]
-    tags = [str(x) for x in state.get("tags", [])]
-    if inbound_ids or tags:
-        backend = str(state.get("backend", ""))
-        if backend == "api":
-            runtime = detect_backend_runtime()
-            panel = setup_panel_client(runtime, interactive=False)
-        else:
-            panel = None
-        try:
-            delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
-        except Exception as e:
-            print(f"删除入站失败: {e}")
-
-    # 清理本地文件
-    for p in (ARGO_TUNNEL_TOKEN_PATH, ARGO_TUNNEL_CONFIG_PATH):
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except OSError:
-            pass
-    try:
-        remove_last_state()
-    except Exception:
-        pass
-
-    print("✅ Argo 隧道卸载完成")
 if __name__ == "__main__":
     main()
