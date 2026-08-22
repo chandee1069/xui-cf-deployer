@@ -2759,13 +2759,7 @@ def main() -> None:
 
     run_deploy_install()
     return
-
-
-if __name__ == "__main__":
-    main()
-
-
-# ========== 固定 Argo 隧道功能 ==========
+    # ========== 固定 Argo 隧道功能 ==========
 def ensure_argo_tunnel_dir() -> None:
     os.makedirs(ARGO_TUNNEL_DIR, exist_ok=True)
 
@@ -3280,3 +3274,5 @@ def run_uninstall_argo() -> None:
         pass
 
     print("✅ Argo 隧道卸载完成")
+if __name__ == "__main__":
+    main()
