@@ -2802,6 +2802,24 @@ def get_public_ipv4_safe() -> str:
         return "127.0.0.1"
 
 
+def _curl_json(email: str, api_key: str, method: str, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """使用 curl 调用 Cloudflare API，返回 JSON 结果。"""
+    cmd = [
+        "curl", "-s",
+        "-X", method,
+        f"{url}",
+        "-H", f"X-Auth-Email: {email}",
+        "-H", f"X-Auth-Key: {api_key}",
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(data, ensure_ascii=False),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"success": False, "errors": [{"message": result.stdout or result.stderr or "curl failed"}]}
+
+
 def create_fixed_argo_tunnel(
     account_id: str,
     headers: Dict[str, str],
@@ -2811,30 +2829,19 @@ def create_fixed_argo_tunnel(
     创建固定 Argo 隧道，返回 (tunnel_id, tunnel_token)。
     使用 Account-level Tunnel。account_id 从 Zone API 返回数据中提取。
     """
-    create_payload = {"name": tunnel_name}
+    cf_email = headers.get("X-Auth-Email", "")
+    cf_key = headers.get("X-Auth-Key", "")
+
     url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels"
-    print(f"  [DEBUG] POST {url}")
-    print(f"  [DEBUG] account_id_len={len(account_id)}")
-    result = call_json_api(
-        "POST",
-        url,
-        headers=headers,
-        data=create_payload,
-        exit_on_http_error=False,
-    )
+    result = _curl_json(cf_email, cf_key, "POST", url, {"name": tunnel_name})
     if not result.get("success"):
         errs = result.get("errors") or [{"message": "创建 Argo Tunnel 失败"}]
         print(json.dumps(errs, ensure_ascii=False))
         sys.exit(1)
     tunnel_id = str(result["result"]["id"])
 
-    token_result = call_json_api(
-        "POST",
-        f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}/credentials",
-        headers=headers,
-        data={"type": "tunnel"},
-        exit_on_http_error=False,
-    )
+    url2 = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}/credentials"
+    token_result = _curl_json(cf_email, cf_key, "POST", url2, {"type": "tunnel"})
     if not token_result.get("success"):
         errs = token_result.get("errors") or [{"message": "获取 Tunnel Token 失败"}]
         print(json.dumps(errs, ensure_ascii=False))
@@ -3104,8 +3111,6 @@ def run_deploy_install_argo() -> None:
     account_id = zone.get("account", {}).get("id", "")
     if not account_id:
         exit_error("无法获取 Cloudflare 账户 ID")
-    print(f"  [DEBUG] account_id={account_id}")
-    print(f"  [DEBUG] zone_account={zone.get('account')}")
 
     # 备份 SSL 模式（Argo 隧道需要 Full）
     ssl_before = get_ssl_mode(zone_id, headers)
@@ -3213,12 +3218,13 @@ def run_uninstall_argo() -> None:
     # 删除 DNS 路由
     if route_id:
         try:
-            call_json_api(
-                "DELETE",
-                f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes/{route_id}",
-                headers=headers,
-                exit_on_http_error=False,
-            )
+            url = f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes/{route_id}"
+            cmd = [
+                "curl", "-s", "-X", "DELETE", url,
+                "-H", f"X-Auth-Email: {cf_email}",
+                "-H", f"X-Auth-Key: {cf_key}",
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=15)
             print(f"已删除 DNS 路由: {route_id}")
         except Exception as e:
             print(f"删除 DNS 路由失败: {e}")
@@ -3226,12 +3232,13 @@ def run_uninstall_argo() -> None:
     # 删除 Tunnel
     if tunnel_id:
         try:
-            call_json_api(
-                "DELETE",
-                f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}",
-                headers=headers,
-                exit_on_http_error=False,
-            )
+            url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}"
+            cmd = [
+                "curl", "-s", "-X", "DELETE", url,
+                "-H", f"X-Auth-Email: {cf_email}",
+                "-H", f"X-Auth-Key: {cf_key}",
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=15)
             print(f"已删除 Argo 隧道: {tunnel_id}")
         except Exception as e:
             print(f"删除 Argo 隧道失败: {e}")
