@@ -2833,7 +2833,8 @@ def create_fixed_argo_tunnel(
 ) -> Tuple[str, str]:
     """
     创建固定 Argo 隧道，返回 (tunnel_id, tunnel_token)。
-    使用 Account-level Tunnel。account_id 从 Zone API 返回数据中提取。
+    使用 Account-level Tunnel。token 直接从创建响应中获取。
+    account_id 从 Zone API 返回数据中提取。
     """
     url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels"
     print(f"  正在创建隧道: {tunnel_name}")
@@ -2845,13 +2846,11 @@ def create_fixed_argo_tunnel(
     tunnel_id = str(result["result"]["id"])
     print(f"  隧道创建成功: {tunnel_id}")
 
-    url2 = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}/credentials"
-    token_result = _cf_post_json(url2, headers, {"type": "tunnel"})
-    if not token_result.get("success"):
-        errs = token_result.get("errors") or [{"message": "获取 Tunnel Token 失败"}]
-        print(json.dumps(errs, ensure_ascii=False))
-        sys.exit(1)
-    tunnel_token = str(token_result["result"]["token"])
+    # 从创建响应中直接获取 tunnel token（API 会返回 credentials_file.token）
+    tunnel_token = str(result["result"].get("token", ""))
+    if not tunnel_token:
+        exit_error("隧道创建成功但未返回 token")
+    print(f"  Token 获取成功")
 
     return tunnel_id, tunnel_token
 
