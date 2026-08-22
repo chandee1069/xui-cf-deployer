@@ -2862,43 +2862,61 @@ def create_argo_tunnel_route(
     headers: Dict[str, str],
 ) -> str:
     """
-    为隧道添加 DNS 路由 (CNAME -> cfargotunnel.com)。
-    返回 tunnel route 的 id。
+    为隧道创建 CNAME DNS 记录指向 cfargotunnel.com。
+    Account-level Tunnel 使用 CNAME 方式路由（不支持 tunnel_routes 的 zone 也适用）。
+    返回 DNS record id。
     """
-    # 检查已有 route
-    routes_result = call_json_api(
-        "GET",
-        f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes",
+    target = f"{tunnel_id}.cfargotunnel.com"
+    print(f"  正在配置 DNS: {domain} -> {target}")
+
+    dns_payload = {
+        "type": "CNAME",
+        "name": domain,
+        "content": target,
+        "ttl": 1,
+        "proxied": True,
+    }
+
+    # 尝试创建，如果已存在则更新
+    result = call_json_api(
+        "POST",
+        f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/dns_records",
         headers=headers,
+        data=dns_payload,
         exit_on_http_error=False,
     )
-    existing_routes = routes_result.get("result", []) if routes_result.get("success") else []
-    for route in existing_routes:
-        if str(route.get("tunnel_id")) == tunnel_id:
-            # 更新已有 route
-            route_id = str(route["id"])
-            update_payload = {"hostname": f"*.{domain}", "tunnel_id": tunnel_id}
+    if result.get("success"):
+        record_id = str(result["result"]["id"])
+        print(f"  DNS CNAME 创建成功: {domain} -> {target}")
+        return record_id
+
+    # 如果已存在，更新
+    errs = result.get("errors", [])
+    existing_ids = []
+    for e in errs:
+        msg = e.get("message", "")
+        if "already exists" in msg or "record already" in msg:
+            existing_ids.append(e)
+    if existing_ids:
+        # 用 GET 查找已有记录
+        q = parse.urlencode({"type": "CNAME", "name": domain})
+        existing = call_cf_api("GET", f"/zones/{zone_id}/dns_records?{q}", headers=headers)
+        if existing:
+            rec = existing[0]
+            rec_id = str(rec["id"])
+            update_payload = {"content": target, "ttl": 1, "proxied": True}
             call_json_api(
                 "PUT",
-                f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes/{route_id}",
+                f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/dns_records/{rec_id}",
                 headers=headers,
                 data=update_payload,
             )
-            return route_id
+            print(f"  DNS CNAME 已更新: {domain} -> {target}")
+            return rec_id
 
-    # 新建 route
-    payload = {"hostname": f"*.{domain}", "tunnel_id": tunnel_id}
-    result = call_json_api(
-        "POST",
-        f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes",
-        headers=headers,
-        data=payload,
-    )
-    if not result.get("success"):
-        errors = result.get("errors") or [{"message": "创建 Argo Tunnel Route 失败"}]
-        print(json.dumps(errors, ensure_ascii=False))
-        sys.exit(1)
-    return str(result["result"]["id"])
+    # 其他错误
+    print(json.dumps(errs, ensure_ascii=False))
+    sys.exit(1)
 
 
 def build_cloudflared_config(
@@ -3219,15 +3237,15 @@ def run_uninstall_argo() -> None:
         subprocess.run(["systemctl", "stop", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
         subprocess.run(["systemctl", "disable", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
 
-    # 删除 DNS 路由
+    # 删除 DNS 记录
     if route_id:
         try:
-            url = f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes/{route_id}"
+            url = f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/dns_records/{route_id}"
             req = request.Request(url, method="DELETE", headers=headers)
             request.urlopen(req)
-            print(f"已删除 DNS 路由: {route_id}")
+            print(f"已删除 DNS 记录: {route_id}")
         except Exception as e:
-            print(f"删除 DNS 路由失败: {e}")
+            print(f"删除 DNS 记录失败: {e}")
 
     # 删除 Tunnel
     if tunnel_id:
