@@ -2805,11 +2805,11 @@ def get_public_ipv4_safe() -> str:
 def _cf_post_json(url: str, headers: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]:
     """使用 urllib 直接 POST JSON 到 Cloudflare API（绕过 call_json_api 的空 body 404 问题）。"""
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    req = request.Request(url, data=body, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with request.urlopen(req) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
+    except error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="ignore")
         print(f"  [API ERROR] HTTP {e.code} {err_body[:500]}")
         try:
@@ -3216,8 +3216,8 @@ def run_uninstall_argo() -> None:
     if route_id:
         try:
             url = f"{CF_TUNNELS_API_BASE}/zones/{zone_id}/tunnel_routes/{route_id}"
-            req = urllib.request.Request(url, method="DELETE", headers=headers)
-            urllib.request.urlopen(req)
+            req = request.Request(url, method="DELETE", headers=headers)
+            request.urlopen(req)
             print(f"已删除 DNS 路由: {route_id}")
         except Exception as e:
             print(f"删除 DNS 路由失败: {e}")
@@ -3226,8 +3226,8 @@ def run_uninstall_argo() -> None:
     if tunnel_id:
         try:
             url = f"{CF_TUNNELS_API_BASE}/accounts/{account_id}/tunnels/{tunnel_id}"
-            req = urllib.request.Request(url, method="DELETE", headers=headers)
-            urllib.request.urlopen(req)
+            req = request.Request(url, method="DELETE", headers=headers)
+            request.urlopen(req)
             print(f"已删除 Argo 隧道: {tunnel_id}")
         except Exception as e:
             print(f"删除 Argo 隧道失败: {e}")
