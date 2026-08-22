@@ -2,6 +2,7 @@
 import http.cookiejar
 import ipaddress
 import json
+import base64
 import os
 import random
 import re
@@ -2937,7 +2938,7 @@ def build_cloudflared_config(
     # 如果只有一条路由，简化配置
     config = {
         "tunnel": tunnel_id,
-        "credentials-file": ARGO_TUNNEL_TOKEN_PATH,
+
         "port": 2000,
         "loglevel": "info",
         "protocol": "quic",
@@ -3024,9 +3025,22 @@ def install_cloudflared_binary() -> Optional[str]:
 
 
 def setup_argo_tunnel_service(cfd_path: str) -> None:
-    """创建 cloudflared systemd service（如果 systemd 可用）。"""
+    """
+    创建 cloudflared systemd service（如果 systemd 可用）。
+    使用 --token 模式启动（token 直接从 Cloudflare API 返回），不依赖 credentials-file。
+    """
     if not shutil.which("systemctl"):
         return
+
+    # 读取隧道 token（从已保存的状态文件中获取）
+    token = ""
+    state = load_argo_tunnel_state()
+    if state:
+        token = state.get("tunnel_token", "")
+
+    if not token:
+        print("\u26a0\ufe0f  未找到隧道 token，cloudflared 服务可能无法正常运行")
+
     service_file = f"""[Unit]
 Description=Cloudflare Argo Tunnel
 After=network.target
@@ -3034,7 +3048,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={cfd_path} tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH}
+ExecStart={cfd_path} tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH} --token {token}
 Restart=always
 RestartSec=30
 Environment=NO_AUTOUPDATE=1
@@ -3049,23 +3063,49 @@ WantedBy=multi-user.target
         subprocess.run(["systemctl", "daemon-reload"], capture_output=True, check=False)
         subprocess.run(["systemctl", "enable", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
         subprocess.run(["systemctl", "start", ARGO_TUNNEL_SERVICE_NAME], capture_output=True, check=False)
-        print(f"✅ Argo Tunnel 服务已创建: {ARGO_TUNNEL_SERVICE_NAME}")
+        print(f"\u2705 Argo Tunnel 服务已创建: {ARGO_TUNNEL_SERVICE_NAME}")
     except Exception as e:
-        print(f"⚠️ Argo Tunnel systemd 服务创建失败: {e}")
-        print(f"⚠️ 请手动运行: {cfd_path} tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH}")
-
+        print(f"\u26a0\ufe0f Argo Tunnel systemd 服务创建失败: {e}")
+        print(f"\u26a0\ufe0f 请手动运行: {cfd_path} tunnel --no-autoupdate run --config {ARGO_TUNNEL_CONFIG_PATH} --token {token}")
 
 def build_links_argo(user_uuid: str, domain: str, routes: List[Dict[str, Any]]) -> Dict[str, str]:
     """
-    使用 Argo 隧道时构建链接。
-    域名直接指向 cloudflared 转发，不需要 Origin Rules 中间层。
+    使用 Argo 隧道时构建订阅链接（标准代理协议 URI）。
+    域名经 CNAME 指向 cfargotunnel.com，TLS 在 Cloudflare 边缘终止，
+    客户端通过 WebSocket + TLS 连接，cloudflared 转发至 x-ui 入站。
+    端口使用 443（TLS），path 对应 cloudflared ingress 规则。
     """
-    # 链接格式类似，但 path 直接对应到 cloudflared ingress 规则
     links = {}
     for route in routes:
         protocol = route["protocol"]
-        path = route["path"]
-        links[protocol] = f"https://{domain}:{route['port']}?path={path}"
+        path_encoded = parse.quote(route["path"].lstrip("/"), safe="")
+        port = 443
+        if protocol == "vless":
+            links[protocol] = (
+                f"vless://{user_uuid}@{domain}:{port}"
+                f"?encryption=none&path=/{path_encoded}&security=tls&type=ws&headerType=none"
+            )
+        elif protocol == "trojan":
+            links[protocol] = (
+                f"trojan://{user_uuid}@{domain}:{port}"
+                f"?encryption=none&path=/{path_encoded}&security=tls&type=ws&headerType=none"
+            )
+        elif protocol == "vmess":
+            vmess_config = {
+                "v": "2",
+                "ps": f"vmess-argo-{domain}",
+                "add": domain,
+                "port": str(port),
+                "id": user_uuid,
+                "aid": "0",
+                "net": "ws",
+                "type": "none",
+                "host": "",
+                "path": route["path"],
+                "tls": "tls",
+            }
+            vmess_json = json.dumps(vmess_config, ensure_ascii=False)
+            links[protocol] = f"vmess://{base64.b64encode(vmess_json.encode()).decode()}"
     return links
 
 
